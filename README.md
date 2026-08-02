@@ -70,6 +70,26 @@ PHPにはADOTディストリビューションが存在しないため、標準�
 
 参考: [PHP zero-code instrumentation](https://opentelemetry.io/docs/zero-code/php/), [Transaction Search](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Transaction-Search.html)
 
+## SLO設定のポイント
+
+`scripts/create-slos.sh` で4サービス分(backend/frontend/nest/laravel)のSLOを作成する際に分かったこと。
+
+- **SLOを作る前に、対象オペレーションが`list-service-operations`に出てくるまで実トラフィックを流す必要がある。**
+  Application Signalsは「発見されたオペレーション」に対してしかSLOを作れない(`list-services` → `list-service-operations` → `create-service-level-objective`の順)。
+- **オペレーション名の粒度は計装方式に依存する。** ADOT(backend/frontend/nest)は`OTEL_AWS_HTTP_OPERATION_PATHS`で
+  ルート単位に分離できるが、PHP(laravel)にはこの仕組みが無く、`GET /laravel`のように第1パスセグメントに
+  丸められる。SLO作成前に必ず`list-service-operations`で実際の名前を確認すること(推測で決め打ちしない)。
+- **`MetricType: AVAILABILITY`でも`MetricThreshold`/`ComparisonOperator`は省略できない。** ドキュメント上は
+  レイテンシ用のパラメータのように読めるが、省略すると`ValidationException: MetricThreshold must not be empty`で弾かれる。
+  可用性なら`MetricThreshold: 99, ComparisonOperator: GreaterThanOrEqualTo`のように明示する。
+- **`KeyAttributes.Environment`がサービスごとに複数に分裂することがある**(`apm-sample` / `ecs:apm-sample` / `ecs:default`など)。
+  直近のトラフィックの発生経路(直接アクセスか、他サービス経由の依存関係としての観測か)によって変わる。
+  SLO作成スクリプトを冪等に保つため、`list-services`で見つからない場合は静かにスキップする設計にしている。
+- **SLOはCDKスタックの外側のリソース。** `cdk destroy`では消えないので、後片付け漏れに注意
+  (`aws application-signals delete-service-level-objective --name <name>`で個別削除)。
+- **SLOとSLAの違い**: CloudWatch Application Signalsに「SLA」という別APIは無い。SLI(指標)とSLO(内部目標)のみで、
+  対顧客の契約(SLA)を表現したい場合はSLOの目標値を厳しめに設定して運用上SLAとして扱う。
+
 ## 前提
 
 - Node.js 20+ / npm
