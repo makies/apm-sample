@@ -82,11 +82,15 @@ export class ApmSampleStack extends cdk.Stack {
     const backendSg = new ec2.SecurityGroup(this, 'BackendSg', { vpc, allowAllOutbound: true })
     const nestSg = new ec2.SecurityGroup(this, 'NestSg', { vpc, allowAllOutbound: true })
     const dbSg = new ec2.SecurityGroup(this, 'DbSg', { vpc, allowAllOutbound: false })
+    const laravelSg = new ec2.SecurityGroup(this, 'LaravelSg', { vpc, allowAllOutbound: true })
+    const mysqlDbSg = new ec2.SecurityGroup(this, 'MysqlDbSg', { vpc, allowAllOutbound: false })
 
     frontendSg.addIngressRule(albSg, ec2.Port.tcp(8080), 'ALB to frontend')
     backendSg.addIngressRule(frontendSg, ec2.Port.tcp(8080), 'Frontend to backend (Service Connect)')
     nestSg.addIngressRule(albSg, ec2.Port.tcp(8080), 'ALB to nest')
     dbSg.addIngressRule(nestSg, ec2.Port.tcp(5432), 'Nest to Aurora Postgres')
+    laravelSg.addIngressRule(albSg, ec2.Port.tcp(8080), 'ALB to laravel')
+    mysqlDbSg.addIngressRule(laravelSg, ec2.Port.tcp(3306), 'Laravel to Aurora MySQL')
 
     // NestJS's own data source, independent of the DynamoDB table above --
     // deliberately not shared with frontend/backend, and not reachable from
@@ -100,6 +104,21 @@ export class ApmSampleStack extends cdk.Stack {
       credentials: rds.Credentials.fromGeneratedSecret('nestapp'),
       // Scales down to 0 ACU when idle -- this is what keeps a demo Aurora
       // cluster from costing anything close to a fixed RDS instance.
+      serverlessV2MinCapacity: 0,
+      serverlessV2MaxCapacity: 1,
+      writer: rds.ClusterInstance.serverlessV2('Writer'),
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    })
+
+    // Laravel's own data source -- same reasoning as NestDb above, just a
+    // different engine (MySQL, via Eloquent) for variety.
+    const laravelDb = new rds.DatabaseCluster(this, 'LaravelDb', {
+      engine: rds.DatabaseClusterEngine.auroraMysql({ version: rds.AuroraMysqlEngineVersion.VER_3_12_0 }),
+      vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      securityGroups: [mysqlDbSg],
+      defaultDatabaseName: 'laravelapp',
+      credentials: rds.Credentials.fromGeneratedSecret('laravelapp'),
       serverlessV2MinCapacity: 0,
       serverlessV2MaxCapacity: 1,
       writer: rds.ClusterInstance.serverlessV2('Writer'),
@@ -174,6 +193,33 @@ export class ApmSampleStack extends cdk.Stack {
     })
     nestService.node.addDependency(nestDb)
 
+    // --- Laravel service (standalone, its own Aurora MySQL, no Service
+    // Connect, no ADOT -- PHP has no ADOT distro, so Application Signals
+    // support comes entirely from Transaction Search server-side) --------
+    const laravelService = this.buildService({
+      vpc,
+      cluster,
+      serviceName: 'laravel',
+      appDir: path.join(__dirname, '../../app/laravel'),
+      securityGroup: laravelSg,
+      cwAgentConfigParam,
+      useAdot: false,
+      environment: {
+        DB_CONNECTION: 'mysql',
+        DB_HOST: laravelDb.clusterEndpoint.hostname,
+        DB_PORT: laravelDb.clusterEndpoint.port.toString(),
+        DB_DATABASE: 'laravelapp',
+        // Not a real secret -- just Laravel's app-level encryption key for
+        // a throwaway demo, fine to bake in as a plain env var.
+        APP_KEY: 'base64:77r4u2USpZGrh0pDIi205jSHnbguDu97SMgzhkvROmg=',
+      },
+      extraSecrets: {
+        DB_USERNAME: ecs.Secret.fromSecretsManager(laravelDb.secret!, 'username'),
+        DB_PASSWORD: ecs.Secret.fromSecretsManager(laravelDb.secret!, 'password'),
+      },
+    })
+    laravelService.node.addDependency(laravelDb)
+
     // --- Load balancer -----------------------------------------------
     const alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
       vpc,
@@ -195,10 +241,19 @@ export class ApmSampleStack extends cdk.Stack {
       targets: [nestService],
       healthCheck: { path: '/nest/health', interval: cdk.Duration.seconds(30) },
     })
+    listener.addTargets('LaravelTarget', {
+      priority: 20,
+      conditions: [elbv2.ListenerCondition.pathPatterns(['/laravel/*'])],
+      port: 8080,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targets: [laravelService],
+      healthCheck: { path: '/laravel/health', interval: cdk.Duration.seconds(30) },
+    })
 
     // --- Outputs -------------------------------------------------------
     new cdk.CfnOutput(this, 'SiteUrl', { value: `http://${alb.loadBalancerDnsName}` })
     new cdk.CfnOutput(this, 'NestUrl', { value: `http://${alb.loadBalancerDnsName}/nest/health` })
+    new cdk.CfnOutput(this, 'LaravelUrl', { value: `http://${alb.loadBalancerDnsName}/laravel/health` })
     new cdk.CfnOutput(this, 'ClusterName', { value: cluster.clusterName })
     new cdk.CfnOutput(this, 'BackendServiceName', { value: backendService.serviceName })
     new cdk.CfnOutput(this, 'FrontendServiceName', { value: frontendService.serviceName })
@@ -216,6 +271,13 @@ export class ApmSampleStack extends cdk.Stack {
     serviceConnect?: ecs.ServiceConnectProps
     cloudMapNamespace?: servicediscovery.INamespace
     extraSecrets?: Record<string, ecs.Secret>
+    // Node/NestJS use AWS's ADOT distro, which understands Application
+    // Signals-specific env vars (xray sampler, the separate metrics
+    // endpoint, OTEL_AWS_HTTP_OPERATION_PATHS). There's no ADOT distro for
+    // PHP -- it uses the vanilla OTel SDK and gets its Application Signals
+    // experience entirely from Transaction Search server-side, so it needs
+    // a different (smaller) set of OTEL_* vars. Default true.
+    useAdot?: boolean
   }): ecs.FargateService {
     const { serviceName } = opts
 
@@ -252,6 +314,42 @@ export class ApmSampleStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     })
 
+    // Endpoints point at the ecs-cwagent sidecar, reachable at localhost
+    // because both containers share the task's network namespace (awsvpc
+    // mode).
+    const otelEnv: Record<string, string> =
+      opts.useAdot === false
+        ? {
+            OTEL_SERVICE_NAME: serviceName,
+            OTEL_TRACES_EXPORTER: 'otlp',
+            OTEL_METRICS_EXPORTER: 'none',
+            OTEL_LOGS_EXPORTER: 'none',
+            OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf',
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://localhost:4316/v1/traces',
+            OTEL_PROPAGATORS: 'baggage,tracecontext',
+            OTEL_RESOURCE_ATTRIBUTES: [
+              `service.name=${serviceName}`,
+              `deployment.environment=${CLUSTER_ENVIRONMENT_NAME}`,
+              `aws.log.group.names=${appLogGroup.logGroupName}`,
+            ].join(','),
+          }
+        : {
+            OTEL_AWS_APPLICATION_SIGNALS_ENABLED: 'true',
+            OTEL_METRICS_EXPORTER: 'none',
+            OTEL_LOGS_EXPORTER: 'none',
+            OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf',
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://localhost:4316/v1/traces',
+            OTEL_AWS_APPLICATION_SIGNALS_EXPORTER_ENDPOINT: 'http://localhost:4316/v1/metrics',
+            OTEL_TRACES_SAMPLER: 'xray',
+            OTEL_TRACES_SAMPLER_ARG: 'endpoint=http://localhost:2000',
+            OTEL_PROPAGATORS: 'tracecontext,baggage,b3,xray',
+            OTEL_RESOURCE_ATTRIBUTES: [
+              `service.name=${serviceName}`,
+              `deployment.environment=${CLUSTER_ENVIRONMENT_NAME}`,
+              `aws.log.group.names=${appLogGroup.logGroupName}`,
+            ].join(','),
+          }
+
     taskDef.addContainer('app', {
       image: ecs.ContainerImage.fromAsset(opts.appDir),
       essential: true,
@@ -261,23 +359,7 @@ export class ApmSampleStack extends cdk.Stack {
       environment: {
         PORT: '8080',
         ...opts.environment,
-        // Application Signals / OTel wiring. Endpoints point at the
-        // ecs-cwagent sidecar, reachable at localhost because both
-        // containers share the task's network namespace (awsvpc mode).
-        OTEL_AWS_APPLICATION_SIGNALS_ENABLED: 'true',
-        OTEL_METRICS_EXPORTER: 'none',
-        OTEL_LOGS_EXPORTER: 'none',
-        OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf',
-        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://localhost:4316/v1/traces',
-        OTEL_AWS_APPLICATION_SIGNALS_EXPORTER_ENDPOINT: 'http://localhost:4316/v1/metrics',
-        OTEL_TRACES_SAMPLER: 'xray',
-        OTEL_TRACES_SAMPLER_ARG: 'endpoint=http://localhost:2000',
-        OTEL_PROPAGATORS: 'tracecontext,baggage,b3,xray',
-        OTEL_RESOURCE_ATTRIBUTES: [
-          `service.name=${serviceName}`,
-          `deployment.environment=${CLUSTER_ENVIRONMENT_NAME}`,
-          `aws.log.group.names=${appLogGroup.logGroupName}`,
-        ].join(','),
+        ...otelEnv,
       },
       secrets: opts.extraSecrets,
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: serviceName, logGroup: appLogGroup }),
